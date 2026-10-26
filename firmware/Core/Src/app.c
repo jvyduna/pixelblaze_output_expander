@@ -85,6 +85,14 @@
  *
  * apa102 needs a start and end frame, better to write these in memory and not require it in the protocol, borrowing 2 pixels of data
  *
+ * UCS7604 (8-bit w/ gamma, 800kbps) rides on WS2812 channels. Pixelblaze can only pick WS2812 or APA102 for the
+ * expander, so a WS2812 channel set to an otherwise unlikely color order is treated as UCS7604 instead:
+ *    WGRB (4 elements) -> UCS7604 RGBW
+ *    GBR  (3 elements) -> UCS7604 RGB
+ * The 15 byte UCS7604 preamble (sync, header, mode, current) and padding are written in front of the pixel data,
+ * and a few black pixels are appended to dodge the chip's tail-of-stream crosstalk bug.
+ * Bit timing is shared by all channels, so while any UCS7604 channel is active the high times are nudged
+ * toward UCS7604 (400/800ns) while staying inside WS2812/SK6812 spec.
  *
  */
 
@@ -119,6 +127,39 @@ typedef struct {
 } PBChannel;
 
 PBChannel channels[8];
+
+#define UCS7604_PREAMBLE_BYTES 15
+#define UCS7604_TAIL_PIXELS 4 //black pixels after the real ones, the tail of the stream can crosstalk
+
+//extra bytes sent on a WS2812 channel beyond pixels * numElements, nonzero means the channel is UCS7604
+uint16_t ucs7604ExtraBytes[8];
+
+static inline int isUcs7604ColorOrder(PBWS2812Channel *ch) {
+	if (ch->numElements == 4) //WGRB
+		return ch->or == 2 && ch->og == 1 && ch->ob == 3 && ch->ow == 0;
+	else //GBR
+		return ch->or == 2 && ch->og == 0 && ch->ob == 1;
+}
+
+//writes the preamble and alignment padding for a UCS7604 channel, returns bytes written
+static int writeUcs7604Header(uint32_t *dst, uint8_t channel, int dataBytes) {
+	uint8_t header[UCS7604_PREAMBLE_BYTES + 2] = {
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, //sync
+			0x00, 0x03, //header
+			0x03, //mode: 8 bit w/ gamma, 800kbps
+			0x0f, 0x0f, 0x0f, 0x0f, //current control RGBW, max
+			0x00, 0x00, //reserved
+			0x00, 0x00 //padding, the frame must be a multiple of 3 bytes
+	};
+	int size = UCS7604_PREAMBLE_BYTES;
+	size += (3 - (size + dataBytes) % 3) % 3;
+	bitConverter(dst, channel, header, size);
+	return size;
+}
+
+static inline int ws2812ChannelBytes(int ch) {
+	return channels[ch].ws2812Channel.pixels * channels[ch].ws2812Channel.numElements + ucs7604ExtraBytes[ch];
+}
 
 
 volatile unsigned long ms;
@@ -206,6 +247,7 @@ static inline void startDrawingChannles() {
 	apa102ClockBits = 0;
 	int maxBytes = 0;
 	int frequency = -1;
+	int ucs7604Active = 0;
 	for (int ch = 0; ch < 8; ch++) {
 		switch (channels[ch].type) {
 		case SET_CHANNEL_WS2812:
@@ -216,8 +258,10 @@ static inline void startDrawingChannles() {
 				}
 				//don't send start bits for disabled channels
 				ws2812StartBits |= 1<<ch;
+				if (ucs7604ExtraBytes[ch])
+					ucs7604Active = 1;
 			}
-			int chBytes = channels[ch].ws2812Channel.pixels * channels[ch].ws2812Channel.numElements;
+			int chBytes = ws2812ChannelBytes(ch);
 			if (chBytes > maxBytes)
 				maxBytes = chBytes;
 			break;
@@ -245,8 +289,13 @@ static inline void startDrawingChannles() {
 	frequency = 800000; //fixed at 800khz for now
 	TIM1->ARR = 99; //80mhz / 800khz = 100
 	TIM1->CCR1 = 4; //ws2812 start bits - this offset seems to produce the least jitter. gives bus time to free up
-	TIM1->CCR3 = TIM1->CCR1 + 24; //triggers data + zeros clocks. 0s chop pulse to 300ns
-	TIM1->CCR4 = TIM1->CCR1 + 56; //ws2812 stop bits for 1s 700ns
+	if (ucs7604Active) {
+		TIM1->CCR3 = TIM1->CCR1 + 28; //0s 350ns
+		TIM1->CCR4 = TIM1->CCR1 + 60; //1s 750ns
+	} else {
+		TIM1->CCR3 = TIM1->CCR1 + 24; //triggers data + zeros clocks. 0s chop pulse to 300ns
+		TIM1->CCR4 = TIM1->CCR1 + 56; //ws2812 stop bits for 1s 700ns
+	}
 	TIM1->CCR2 = TIM1->CCR3 + 50; //sets clock high to latch 50% after data. trigger at same time and let DMA priority handle it.
 
 	uint32_t maxBits = maxBytes *8;
@@ -387,7 +436,15 @@ static inline void handleIncomming() {
 
 			if (ch.numElements < 3 || ch.numElements > 4)
 				return;
-			if (ch.pixels * ch.numElements > BYTES_PER_CHANNEL)
+
+			int ucs7604 = isUcs7604ColorOrder(&ch);
+			int extraBytes = 0;
+			if (ucs7604) {
+				int dataBytes = (ch.pixels + UCS7604_TAIL_PIXELS) * ch.numElements;
+				extraBytes = UCS7604_PREAMBLE_BYTES + (3 - (UCS7604_PREAMBLE_BYTES + dataBytes) % 3) % 3
+						+ UCS7604_TAIL_PIXELS * ch.numElements;
+			}
+			if (ch.pixels * ch.numElements + extraBytes > BYTES_PER_CHANNEL)
 				return;
 
 			//check that it's addressed to us and remap
@@ -397,11 +454,20 @@ static inline void handleIncomming() {
 			uint8_t og = ch.og;
 			uint8_t ob = ch.ob;
 			uint8_t ow = ch.ow;
+			if (ucs7604) {
+				//UCS7604 is always RGB(W) on the wire
+				or = 0;
+				og = 1;
+				ob = 2;
+				ow = 3;
+			}
 
 			uint8_t elements[4];
 
 			uint32_t * dst = bitBuffer;
 			int stride = 2*ch.numElements;
+			if (ucs7604)
+				dst += 2 * writeUcs7604Header(dst, channel, (ch.pixels + UCS7604_TAIL_PIXELS) * ch.numElements);
 			for (int i = 0; i < ch.pixels; i++) {
 				elements[or] = uartGetc();
 				elements[og] = uartGetc();
@@ -414,6 +480,15 @@ static inline void handleIncomming() {
 				dst += stride;
 			}
 
+			if (ucs7604) {
+				//black tail pixels
+				elements[0] = elements[1] = elements[2] = elements[3] = 0;
+				for (int i = 0; i < UCS7604_TAIL_PIXELS; i++) {
+					bitConverter(dst, channel, elements, ch.numElements);
+					dst += stride;
+				}
+			}
+
 			volatile uint32_t crcExpected = uartGetCrc();
 			volatile uint32_t crcRead;
 			uartRead((void *) &crcRead, sizeof(crcRead));
@@ -421,18 +496,19 @@ static inline void handleIncomming() {
 			if (channel < 8) { //check that it was addressed to us (not 0xff)
 				int blocksToZero;
 				if (crcExpected == crcRead) {
+					int chBytes = ch.pixels * ch.numElements + extraBytes;
 					if (channels[channel].type == SET_CHANNEL_WS2812
-							&& (ch.pixels * ch.numElements >=
-									channels[channel].ws2812Channel.pixels * channels[channel].ws2812Channel.numElements)
+							&& chBytes >= ws2812ChannelBytes(channel)
 						) {
 						blocksToZero = 0;
 					} else {
 						//we need to zero out previous data if the data received was less than last time
-						blocksToZero = BYTES_PER_CHANNEL - ch.numElements * ch.pixels;
+						blocksToZero = BYTES_PER_CHANNEL - chBytes;
 					}
 
 					channels[channel].type = SET_CHANNEL_WS2812;
 					channels[channel].ws2812Channel = ch;
+					ucs7604ExtraBytes[channel] = extraBytes;
 
 					lastValidChannelMs = ms;
 				} else {
@@ -441,6 +517,7 @@ static inline void handleIncomming() {
 					debugStats.crcErrors++;
 					channels[channel].type = SET_CHANNEL_WS2812;
 					memset(&channels[channel].ws2812Channel, 0, sizeof(channels[0].ws2812Channel));
+					ucs7604ExtraBytes[channel] = 0;
 					blocksToZero = BYTES_PER_CHANNEL;
 				}
 				//zero out any remaining data in the buffer for this channel
